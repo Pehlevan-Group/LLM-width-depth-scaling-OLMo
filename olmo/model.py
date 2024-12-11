@@ -403,6 +403,22 @@ def alibi_attention_bias(seq_len: int, config: ModelConfig, device: torch.device
     return alibi_bias * (1.0 / (2 ** m.view(1, config.n_heads, 1, 1)))  # type: ignore
 
 
+
+# defines update structure for weights in hidden layers of the network
+class Body_Linear(nn.Module):
+    
+    def __init__(self, fan_in, fan_out, base_width, bias, device):
+        super().__init__()
+        self.fan_in = fan_in
+        self.fan_out = fan_out
+        self.base_width = base_width
+        self.linear = nn.Linear(fan_in, fan_out, bias = False, device=device)
+        
+    def forward(self, x):
+        return self.base_width/ self.fan_in * self.linear(x)
+    
+    
+
 class OLMoBlock(nn.Module):
     """
     A base class for transformer block implementations.
@@ -444,17 +460,27 @@ class OLMoBlock(nn.Module):
         assert (self.act.output_multiplier * self.hidden_size) % 1 == 0
 
         # Attention output projection.
-        self.attn_out = nn.Linear(
-            config.d_model, config.d_model, bias=config.include_bias, device=config.init_device
-        )
+        
+        self.base_width = 384
+        self.base_heads = 4
+        self.attn_out = Body_Linear(config.d_model, config.d_model, self.base_width, bias=False, device=config.init_device)
 
         # Feed-forward output projection.
-        self.ff_out = nn.Linear(
+        #self.ff_out = nn.Linear(
+        #    int(self.act.output_multiplier * self.hidden_size),
+        #    config.d_model,
+        #    bias=config.include_bias,
+        #    device=config.init_device,
+        #)
+        
+        self.ff_out = Body_Linear(
             int(self.act.output_multiplier * self.hidden_size),
             config.d_model,
+            self.base_width,
             bias=config.include_bias,
             device=config.init_device,
         )
+        
         self.ff_out._is_residual = True  # type: ignore
 
         # Rotary embeddings.
@@ -497,8 +523,8 @@ class OLMoBlock(nn.Module):
         else:
             raise NotImplementedError(self.config.init_fn)
 
-        init_normal(self.attn_out, std=attn_out_std, init_cutoff_factor=cutoff_factor)
-        init_normal(self.ff_out, std=ff_out_std, init_cutoff_factor=cutoff_factor)
+        init_normal(self.attn_out.linear, std=attn_out_std * math.sqrt( self.attn_out.fan_in / self.attn_out.base_width ) , init_cutoff_factor=cutoff_factor)
+        init_normal(self.ff_out.linear, std=ff_out_std * math.sqrt( self.ff_out.fan_in / self.ff_out.base_width ) , init_cutoff_factor=cutoff_factor )
 
     def set_activation_checkpointing(
         self, strategy: Optional[ActivationCheckpointingStrategy], checkpoint_func: Optional[Callable] = None
@@ -661,12 +687,15 @@ class OLMoBlock(nn.Module):
     @classmethod
     def build(cls, layer_id: int, config: ModelConfig, cache: BufferCache) -> OLMoBlock:
         if config.block_type == BlockType.sequential:
-            return OLMoSequentialBlock(layer_id, config, cache)
+            #return OLMoSequentialBlock(layer_id, config, cache)
+            return OLMoSequentialBlock_muP(layer_id, config, cache)
         elif config.block_type == BlockType.llama:
             return OLMoLlamaBlock(layer_id, config, cache)
         else:
             raise NotImplementedError(f"Unknown block type: '{config.block_type}'")
 
+
+    
 
 class OLMoSequentialBlock(OLMoBlock):
     """
@@ -784,7 +813,9 @@ class OLMoSequentialBlock(OLMoBlock):
 
         # Add attention scores.
         # shape: (B, T, C)
-        x = x + self.dropout(att)
+
+        depth_mult = self.config.n_layers_base / self.config.n_layers
+        x = x + depth_mult * self.dropout(att)
 
         # Add feed-forward projection.
         # shape: (batch_size, seq_len, d_model)
@@ -811,9 +842,174 @@ class OLMoSequentialBlock(OLMoBlock):
                 x = self.ff_norm(x)
 
         x = self.dropout(x)
-        x = og_x + x
+        x = og_x + depth_mult * x
 
         return x, cache
+
+
+
+class OLMoSequentialBlock_muP(OLMoBlock):
+    """
+    This is a typical transformer block where the output is computed as ``MLP(LN(x + Attention(LN(x))))``
+    (plus another skip connection). To compute it as ``LN(MLP(x + LN(Attention(x))))``,
+    use the flag `norm_after`.
+    """
+
+    def __init__(self, layer_id: int, config: ModelConfig, cache: BufferCache):
+        super().__init__(layer_id, config, cache)
+        # Attention input projection. Projects x -> (q, k, v)
+
+        head_dim = config.d_model // config.n_heads
+        self.fused_dims = (
+            config.d_model,
+            config.effective_n_kv_heads * head_dim,
+            config.effective_n_kv_heads * head_dim,
+        )
+        
+        #self.att_proj = nn.Linear(
+        #    config.d_model, sum(self.fused_dims), bias=config.include_bias, device=config.init_device
+        #)
+        self.base_width = 384
+        self.base_heads = 4
+        
+        self.base_dhead = self.base_width//self.base_heads
+        
+        self.att_proj = Body_Linear(
+            config.d_model, sum(self.fused_dims), base_width = self.base_width, bias=config.include_bias, device=config.init_device
+        )
+        
+        # Feed-forward input projection.
+        self.ff_proj = Body_Linear(
+            config.d_model, self.hidden_size, base_width = self.base_width, bias=config.include_bias, device=config.init_device
+        )
+
+        # Layer norms.
+        self.attn_norm = LayerNorm.build(config, size=config.d_model)
+        self.ff_norm = LayerNorm.build(config, size=config.d_model)
+
+    def reset_parameters(self):
+        super().reset_parameters()
+        self.attn_norm.reset_parameters()
+        self.ff_norm.reset_parameters()
+        # NOTE: the standard deviation for these weights does not depend on the layer.
+
+        if self.config.init_fn == InitFnType.normal:
+            std = self.config.init_std
+            cutoff_factor = self.config.init_cutoff_factor
+        elif self.config.init_fn == InitFnType.mitchell:
+            std = 1 / math.sqrt(self.config.d_model)
+            cutoff_factor = self.config.init_cutoff_factor or 3.0
+        elif self.config.init_fn == InitFnType.full_megatron:
+            std = self.config.init_std
+            cutoff_factor = self.config.init_cutoff_factor or 3.0
+        else:
+            raise NotImplementedError(self.config.init_fn)
+
+        init_normal(self.att_proj.linear, std * math.sqrt( self.att_proj.fan_in / self.att_proj.base_width ), cutoff_factor )
+        init_normal(self.ff_proj.linear, std * math.sqrt( self.ff_proj.fan_in / self.ff_proj.base_width ) , cutoff_factor )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_bias: Optional[torch.Tensor] = None,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        max_doc_len: Optional[int] = None,
+        cu_doc_lens: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        # Get query, key, value projections.
+        # shape:
+        #  - for regular attn q, k, v: (batch_size, seq_len, d_model)
+        #  - for multi-query attn q: (batch_size, seq_len, d_model)
+        #                      k, v: (batch_size, seq_len, d_model // n_heads)
+        #  - for group query attn q: (batch_size, seq_len, d_model)
+        #                      k, v: (batch_size, seq_len, d_model // n_kv_heads)
+
+        # apply norm before
+        if not self.config.norm_after:
+            if self._activation_checkpoint_fn is not None:
+                h = self._activation_checkpoint_fn(self.attn_norm, x)
+            else:
+                h = self.attn_norm(x)
+        else:
+            h = x
+
+        qkv = self.att_proj(h)
+
+        if self.config.clip_qkv is not None:
+            qkv.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
+
+        q, k, v = qkv.split(self.fused_dims, dim=-1)
+        
+        head_dim = self.config.d_model // self.config.n_heads
+        # Get attention scores.
+        if self._activation_checkpoint_fn is not None:
+            att, cache = self._activation_checkpoint_fn(  # type: ignore
+                self.attention,
+                q * math.sqrt( self.base_dhead / head_dim ),
+                k * math.sqrt( self.base_dhead / head_dim ),
+                v,
+                attention_bias,
+                layer_past=layer_past,
+                use_cache=use_cache,
+                max_doc_len=max_doc_len,
+                cu_doc_lens=cu_doc_lens,
+            )
+        else:
+            att, cache = self.attention(
+                q * math.sqrt( self.base_dhead / head_dim ),
+                k * math.sqrt( self.base_dhead / head_dim ),
+                v,
+                attention_bias,
+                layer_past=layer_past,
+                use_cache=use_cache,
+                max_doc_len=max_doc_len,
+                cu_doc_lens=cu_doc_lens,
+            )
+
+        if self.config.norm_after:
+            if self._activation_checkpoint_fn is not None:
+                att = self._activation_checkpoint_fn(self.attn_norm, att)
+            else:
+                att = self.attn_norm(att)
+
+        # Add attention scores.
+        # shape: (B, T, C)
+
+        depth_mult = self.config.n_layers_base / self.config.n_layers
+        x = x + depth_mult * self.dropout(att)
+
+        # Add feed-forward projection.
+        # shape: (batch_size, seq_len, d_model)
+        og_x = x
+
+        if not self.config.norm_after:
+            if self._activation_checkpoint_fn is not None:
+                x = self._activation_checkpoint_fn(self.ff_norm, x)  # type: ignore
+            else:
+                x = self.ff_norm(x)
+
+        x = self.ff_proj(x)
+
+        if self._activation_checkpoint_fn is not None:
+            x = self._activation_checkpoint_fn(self.act, x)  # type: ignore
+        else:
+            x = self.act(x)
+        x = self.ff_out(x)
+
+        if self.config.norm_after:
+            if self._activation_checkpoint_fn is not None:
+                x = self._activation_checkpoint_fn(self.ff_norm, x)  # type: ignore
+            else:
+                x = self.ff_norm(x)
+
+        x = self.dropout(x)
+        x = og_x + depth_mult * x
+
+        return x, cache
+
+
+    
 
 
 class OLMoLlamaBlock(OLMoBlock):
@@ -1442,15 +1638,20 @@ class OLMo(nn.Module):
             # add final hidden state post-final-layernorm, following HuggingFace's convention
             all_hidden_states.append(x)
 
+        
+        self.base_width = 384
+        out_mult = self.base_width / self.config.d_model
+            
         # Get logits.
         # shape: (batch_size, seq_len or 1, vocab_size)
         if self.config.weight_tying:
-            logits = F.linear(x, self.transformer.wte.weight, None)  # type: ignore
+            logits = F.linear(x, self.transformer.wte.weight, None) * out_mult   # type: ignore
         else:
-            logits = self.transformer.ff_out(x)  # type: ignore
+            logits = self.transformer.ff_out(x) * out_mult  # type: ignore
         if self.config.scale_logits:
             logits.mul_(1 / math.sqrt(self.config.d_model))
 
+        
         return OLMoOutput(
             logits=logits,
             attn_key_values=attn_key_values,
