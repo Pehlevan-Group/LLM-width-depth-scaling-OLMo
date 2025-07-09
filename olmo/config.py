@@ -266,7 +266,9 @@ class ModelConfig(BaseConfig):
     The number of layers/blocks.
     """
     
-    n_layers_base: int = 12
+    block_loops: int = 2
+    
+    n_layers_base: int = 8
 
     mlp_ratio: int = 4
     """

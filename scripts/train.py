@@ -66,6 +66,9 @@ def main(cfg: TrainConfig) -> None:
 
     device = torch.device("cuda")
 
+    print("The block loops are")
+    print(cfg.model)
+    
     # Fill some configuration options.
     cfg.model.precision = cfg.precision
     cfg.device_train_batch_size = cfg.global_train_batch_size // get_world_size()
@@ -127,7 +130,8 @@ def main(cfg: TrainConfig) -> None:
 
     # Initialize the model.
     log.info("Building model...")
-    olmo_model = OLMo(cfg.model)
+    with torch.device("meta"):
+        olmo_model = OLMo(cfg.model)
     log.info(f"Total number of parameters: {olmo_model.num_params():,d}")
     log.info(f"Number of non-embedding parameters: {olmo_model.num_params(include_embedding=False):,d}")
     log.info(f"Peak GPU Memory (MB) before {cfg.distributed_strategy}: {int(peak_gpu_memory() or 0)}")
